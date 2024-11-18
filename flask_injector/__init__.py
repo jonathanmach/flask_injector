@@ -25,7 +25,7 @@ try:
 except ImportError:
     flask_restx = None
 
-from injector import Binder, Injector, inject
+from injector import Binder, Injector, get_bindings, inject
 from flask import Config, Request
 from werkzeug.local import Local, LocalManager, LocalProxy
 from werkzeug.wrappers import Response
@@ -39,6 +39,13 @@ __all__ = ['request', 'RequestScope', 'Config', 'Request', 'FlaskInjector']
 T = TypeVar('T', LocalProxy, Callable)
 
 
+class InjectorConfig:
+    inject_explicit_only: bool
+
+    def __init__(self, inject_explicit_only: bool = False) -> None:
+        self.inject_explicit_only = inject_explicit_only
+
+
 def instance_method_wrapper(im: T) -> T:
     @functools.wraps(im)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -47,7 +54,7 @@ def instance_method_wrapper(im: T) -> T:
     return wrapper  # type: ignore
 
 
-def wrap_fun(fun: T, injector: Injector) -> T:
+def wrap_fun(fun: T, injector: Injector, config: InjectorConfig) -> T:
     if isinstance(fun, LocalProxy):
         return fun  # type: ignore
 
@@ -64,7 +71,10 @@ def wrap_fun(fun: T, injector: Injector) -> T:
 
     if hasattr(fun, '__call__') and not isinstance(fun, type):
         try:
-            type_hints = get_type_hints(fun)
+            if config.inject_explicit_only:
+                type_hints = get_bindings(fun) # detect if we actually have anything to inject
+            else:
+                type_hints = get_type_hints(fun)
         except (AttributeError, TypeError):
             # Some callables aren't introspectable with get_type_hints,
             # let's assume they don't have anything to inject. The exception
@@ -78,7 +88,12 @@ def wrap_fun(fun: T, injector: Injector) -> T:
             type_hints.pop('return', None)
             wrap_it = type_hints != {}
         if wrap_it:
+            if config.inject_explicit_only:
+                return wrap_fun(fun, injector, config)  # in this case we don't assume we want to inject everything by default
+
             return wrap_fun(inject(fun), injector)
+
+                
 
     return fun
 
@@ -274,7 +289,6 @@ request = ScopeDecorator(RequestScope)
 
 _ModuleT = Union[Callable[[Binder], Any], Module]
 
-
 class FlaskInjector:
     def __init__(
         self,
@@ -282,6 +296,7 @@ class FlaskInjector:
         modules: Iterable[_ModuleT] = [],
         injector: Injector = None,
         request_scope_class: type = RequestScope,
+        inject_explicit_only: bool = False,
     ) -> None:
         """Initializes Injector for the application.
 
@@ -294,6 +309,7 @@ class FlaskInjector:
         :param modules: Configuration for newly created :class:`injector.Injector`
         :param injector: Injector to initialize app with, if not provided
             a new instance will be created.
+        :param inject_explicit_only: If set to True, only inject parameters explicitly marked with Inject[SomeType].
         :type app: :class:`flask.Flask`
         :type modules: Iterable of configuration modules
         :rtype: :class:`injector.Injector`
@@ -306,6 +322,7 @@ class FlaskInjector:
         for module in modules:
             injector.binder.install(module)
 
+        config = InjectorConfig(inject_explicit_only=inject_explicit_only)
         for container in (
             app.view_functions,
             app.before_request_funcs,
@@ -315,7 +332,7 @@ class FlaskInjector:
             app.jinja_env.globals,
             app.error_handler_spec,
         ):
-            process_dict(container, injector)
+            process_dict(container, injector, config)
 
         # This is to make sure that mypy sees a non-nullable variable
         # in the closures below, otherwise it'd complain that injector
@@ -361,23 +378,23 @@ class FlaskInjector:
         self.app = app
 
 
-def process_dict(d: Dict, injector: Injector) -> None:
+def process_dict(d: Dict, injector: Injector, config: InjectorConfig) -> None:
     for key, value in d.items():
         if isinstance(value, LocalProxy):
             # We need this no-op here, because if we have a LocalProxy and try to use isinstance() on it
             # we'll get a RuntimeError
             pass
         elif isinstance(value, list):
-            process_list(value, injector)
+            process_list(value, injector, config)
         elif hasattr(value, '__call__'):
-            d[key] = wrap_fun(value, injector)
+            d[key] = wrap_fun(value, injector, config)
         elif isinstance(value, dict):
-            process_dict(value, injector)
+            process_dict(value, injector, config)
 
 
-def process_list(l: List, injector: Injector) -> None:
+def process_list(l: List, injector: Injector, config: InjectorConfig) -> None:
     # This function mutates the l parameter
-    l[:] = [wrap_fun(fun, injector) for fun in l]
+    l[:] = [wrap_fun(fun, injector, config) for fun in l]
 
 
 class FlaskModule(Module):
